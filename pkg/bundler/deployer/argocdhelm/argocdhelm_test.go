@@ -37,6 +37,7 @@ import (
 	"github.com/NVIDIA/aicr/pkg/allocpolicy"
 	"github.com/NVIDIA/aicr/pkg/bundler/config"
 	"github.com/NVIDIA/aicr/pkg/bundler/deployer"
+	"github.com/NVIDIA/aicr/pkg/bundler/deployer/argocd/argocdtest"
 	"github.com/NVIDIA/aicr/pkg/bundler/gatemanifest"
 	"github.com/NVIDIA/aicr/pkg/component"
 	"github.com/NVIDIA/aicr/pkg/defaults"
@@ -3422,78 +3423,18 @@ func TestHelmTemplate_IncludeRootAppToggle(t *testing.T) {
 // TestHelmTemplate_ChildNameGuards below. Preflight must reject every case
 // Generate does.
 func TestGenerate_ChildNameLimits(t *testing.T) {
-	manifest := map[string]map[string][]byte{
-		"gpu-operator": {"extra.yaml": []byte("apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: extra\n")},
-	}
-	collide := func(parent string) func(*Generator) {
-		return func(g *Generator) {
-			g.AppName = parent
-			g.NamePrefix = "tenant-"
-		}
-	}
-	tests := []struct {
-		name      string
-		mutate    func(*Generator)
-		errSubstr string
-	}{
-		{
-			name:      "composed name exceeds Helm release-name cap",
-			mutate:    func(g *Generator) { g.NamePrefix = strings.Repeat("a", 49) + "-" },
-			errSubstr: "53",
-		},
-		{
-			name:      "child name collides with parent app name",
-			mutate:    collide("tenant-gpu-operator"),
-			errSubstr: "collides",
-		},
-		{
-			name: "pre child collides with parent app name",
-			mutate: func(g *Generator) {
-				collide("tenant-gpu-operator-pre")(g)
-				g.ComponentPreManifests = manifest
-			},
-			errSubstr: "collides",
-		},
-		{
-			name: "post child collides with parent app name",
-			mutate: func(g *Generator) {
-				collide("tenant-gpu-operator-post")(g)
-				g.ComponentPostManifests = manifest
-			},
-			errSubstr: "collides",
-		},
-		{
-			name: "readiness child collides with parent app name",
-			mutate: func(g *Generator) {
-				collide("tenant-gpu-operator-readiness")(g)
-				g.ComponentReadiness = manifest
-			},
-			errSubstr: "collides",
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
+	for _, tt := range argocdtest.ChildNameCases() {
+		t.Run(tt.Name, func(t *testing.T) {
 			g := newTestHelmGenerator(t)
-			tt.mutate(g)
+			g.AppName, g.NamePrefix = tt.AppName, tt.NamePrefix
+			g.ComponentPreManifests, g.ComponentPostManifests, g.ComponentReadiness = tt.PreManifests, tt.PostManifests, tt.Readiness
 			outputDir := filepath.Join(t.TempDir(), "bundle")
 			_, genErr := g.Generate(context.Background(), outputDir)
 			if _, statErr := os.Stat(outputDir); !os.IsNotExist(statErr) {
 				t.Errorf("rejected bundle left output behind: stat error = %v", statErr)
 			}
-			for entry, err := range map[string]error{
-				"Generate":  genErr,
-				"Preflight": g.Preflight(context.Background()),
-			} {
-				if err == nil {
-					t.Fatalf("%s: expected error, got nil", entry)
-				}
-				if errorstest.ReportedCode(err) != aicrerrors.ErrCodeInvalidRequest {
-					t.Errorf("%s: error code = %v, want ErrCodeInvalidRequest", entry, err)
-				}
-				if !strings.Contains(err.Error(), tt.errSubstr) {
-					t.Errorf("%s: error %q does not mention %q", entry, err.Error(), tt.errSubstr)
-				}
-			}
+			argocdtest.WantRejected(t, "Generate", genErr, tt.ErrSubstr)
+			argocdtest.WantRejected(t, "Preflight", g.Preflight(context.Background()), tt.ErrSubstr)
 		})
 	}
 }
