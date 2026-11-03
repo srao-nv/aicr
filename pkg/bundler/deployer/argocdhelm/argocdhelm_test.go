@@ -3419,8 +3419,18 @@ func TestHelmTemplate_IncludeRootAppToggle(t *testing.T) {
 // Helm's 53-character release-name cap and names colliding with the
 // parent Application are rejected with ErrCodeInvalidRequest before any
 // output is written. The install-time equivalents are covered by
-// TestHelmTemplate_ChildNameGuards below.
+// TestHelmTemplate_ChildNameGuards below. Preflight must reject every case
+// Generate does.
 func TestGenerate_ChildNameLimits(t *testing.T) {
+	manifest := map[string]map[string][]byte{
+		"gpu-operator": {"extra.yaml": []byte("apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: extra\n")},
+	}
+	collide := func(parent string) func(*Generator) {
+		return func(g *Generator) {
+			g.AppName = parent
+			g.NamePrefix = "tenant-"
+		}
+	}
 	tests := []struct {
 		name      string
 		mutate    func(*Generator)
@@ -3432,10 +3442,31 @@ func TestGenerate_ChildNameLimits(t *testing.T) {
 			errSubstr: "53",
 		},
 		{
-			name: "child name collides with parent app name",
+			name:      "child name collides with parent app name",
+			mutate:    collide("tenant-gpu-operator"),
+			errSubstr: "collides",
+		},
+		{
+			name: "pre child collides with parent app name",
 			mutate: func(g *Generator) {
-				g.AppName = "tenant-gpu-operator"
-				g.NamePrefix = "tenant-"
+				collide("tenant-gpu-operator-pre")(g)
+				g.ComponentPreManifests = manifest
+			},
+			errSubstr: "collides",
+		},
+		{
+			name: "post child collides with parent app name",
+			mutate: func(g *Generator) {
+				collide("tenant-gpu-operator-post")(g)
+				g.ComponentPostManifests = manifest
+			},
+			errSubstr: "collides",
+		},
+		{
+			name: "readiness child collides with parent app name",
+			mutate: func(g *Generator) {
+				collide("tenant-gpu-operator-readiness")(g)
+				g.ComponentReadiness = manifest
 			},
 			errSubstr: "collides",
 		},
@@ -3445,18 +3476,23 @@ func TestGenerate_ChildNameLimits(t *testing.T) {
 			g := newTestHelmGenerator(t)
 			tt.mutate(g)
 			outputDir := filepath.Join(t.TempDir(), "bundle")
-			_, err := g.Generate(context.Background(), outputDir)
-			if err == nil {
-				t.Fatal("expected error, got nil")
-			}
+			_, genErr := g.Generate(context.Background(), outputDir)
 			if _, statErr := os.Stat(outputDir); !os.IsNotExist(statErr) {
 				t.Errorf("rejected bundle left output behind: stat error = %v", statErr)
 			}
-			if errorstest.ReportedCode(err) != aicrerrors.ErrCodeInvalidRequest {
-				t.Errorf("error code = %v, want ErrCodeInvalidRequest", err)
-			}
-			if !strings.Contains(err.Error(), tt.errSubstr) {
-				t.Errorf("error %q does not mention %q", err.Error(), tt.errSubstr)
+			for entry, err := range map[string]error{
+				"Generate":  genErr,
+				"Preflight": g.Preflight(context.Background()),
+			} {
+				if err == nil {
+					t.Fatalf("%s: expected error, got nil", entry)
+				}
+				if errorstest.ReportedCode(err) != aicrerrors.ErrCodeInvalidRequest {
+					t.Errorf("%s: error code = %v, want ErrCodeInvalidRequest", entry, err)
+				}
+				if !strings.Contains(err.Error(), tt.errSubstr) {
+					t.Errorf("%s: error %q does not mention %q", entry, err.Error(), tt.errSubstr)
+				}
 			}
 		})
 	}

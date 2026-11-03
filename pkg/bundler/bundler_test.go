@@ -5790,6 +5790,107 @@ func TestMake_RejectsDeployerConfigBeforeOutput(t *testing.T) {
 	}
 }
 
+// TestMake_DataFilesWaitForArgoChildNames covers --data with a child
+// Application name the Argo CD deployers reject. os.CopyFS does not
+// overwrite, so data files left by the rejected run would fail a corrected
+// rerun into the same directory.
+func TestMake_DataFilesWaitForArgoChildNames(t *testing.T) {
+	dataDir := t.TempDir()
+	registryYAML := []byte("apiVersion: aicr.run/v1beta1\nkind: ComponentRegistry\ncomponents: []\n")
+	if err := os.WriteFile(filepath.Join(dataDir, "registry.yaml"), registryYAML, 0o600); err != nil {
+		t.Fatalf("write registry.yaml: %v", err)
+	}
+	embedded := recipe.NewEmbeddedDataProvider(recipe.GetEmbeddedFS(), "")
+	layered, err := recipe.NewLayeredDataProvider(embedded, recipe.LayeredProviderConfig{ExternalDir: dataDir})
+	if err != nil {
+		t.Fatalf("NewLayeredDataProvider: %v", err)
+	}
+	recipe.EvictCachedRegistry(layered)
+	t.Cleanup(func() { recipe.EvictCachedRegistry(layered) })
+
+	prefix := "t1-"
+	makeBundle := func(t *testing.T, deployerType config.DeployerType, appName, dir string, opts ...Option) error {
+		t.Helper()
+		cfg := config.NewConfig(
+			config.WithDeployer(deployerType),
+			config.WithRepoURL("https://github.com/example/gitops.git"),
+			config.WithAppName(appName),
+			config.WithArgoCDSettings(config.ArgoCDSettings{NamePrefix: &prefix}),
+			config.WithAttest(true),
+		)
+		b, newErr := New(append([]Option{WithConfig(cfg), WithVerifiedBinaryAttestation([]byte("stub"))}, opts...)...)
+		if newErr != nil {
+			t.Fatalf("New: %v", newErr)
+		}
+		rr := closedWorldRecipeResult()
+		rr.BindDataProvider(layered)
+		_, makeErr := b.Make(t.Context(), rr, dir)
+		return makeErr
+	}
+	const rejectedAppName = "t1-gpu-operator"
+	wantReject := func(t *testing.T, err error) {
+		t.Helper()
+		if err == nil || !strings.Contains(err.Error(), "collides") {
+			t.Fatalf("Make() error = %v, want the parent-name collision", err)
+		}
+		errorstest.WantReportedCode(t, err, errors.ErrCodeInvalidRequest)
+	}
+
+	for _, deployerType := range []config.DeployerType{config.DeployerArgoCD, config.DeployerArgoCDHelm} {
+		t.Run(string(deployerType)+" rejected name creates nothing and a corrected rerun succeeds", func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), "out")
+			wantReject(t, makeBundle(t, deployerType, rejectedAppName, dir, WithAttester(&recordingAttester{})))
+			if _, statErr := os.Stat(dir); !stderrors.Is(statErr, os.ErrNotExist) {
+				t.Fatalf("output directory exists after rejection: %v", statErr)
+			}
+
+			att := &recordingAttester{}
+			if err := makeBundle(t, deployerType, "good", dir, WithAttester(att)); err != nil {
+				t.Fatalf("corrected rerun: %v", err)
+			}
+			if _, statErr := os.Stat(filepath.Join(dir, "data", "registry.yaml")); statErr != nil {
+				t.Errorf("bundle is missing data/registry.yaml: %v", statErr)
+			}
+			sums, readErr := os.ReadFile(filepath.Join(dir, checksum.ChecksumFileName))
+			if readErr != nil {
+				t.Fatalf("read checksums: %v", readErr)
+			}
+			if !strings.Contains(string(sums), "data/registry.yaml") {
+				t.Errorf("checksums do not track data/registry.yaml:\n%s", sums)
+			}
+			if att.subject == nil {
+				t.Fatal("attester was not called")
+			}
+			uris := make([]string, 0, len(att.subject.ResolvedDependencies))
+			for _, dep := range att.subject.ResolvedDependencies {
+				uris = append(uris, dep.URI)
+			}
+			if !slices.Contains(uris, "file://data/registry.yaml") {
+				t.Errorf("attestation dependencies = %v, want file://data/registry.yaml", uris)
+			}
+		})
+
+		t.Run(string(deployerType)+" rejected name keeps an existing directory as found", func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, "keep.txt"), []byte("keep"), 0o600); err != nil {
+				t.Fatalf("seed: %v", err)
+			}
+			wantReject(t, makeBundle(t, deployerType, rejectedAppName, dir, WithAttester(&recordingAttester{})))
+			entries, readErr := os.ReadDir(dir)
+			if readErr != nil {
+				t.Fatalf("read output directory: %v", readErr)
+			}
+			if len(entries) != 1 || entries[0].Name() != "keep.txt" {
+				names := make([]string, 0, len(entries))
+				for _, e := range entries {
+					names = append(names, e.Name())
+				}
+				t.Errorf("output directory = %v, want only keep.txt", names)
+			}
+		})
+	}
+}
+
 // TestCreateDeployer_ArgoCDSettings covers the dedicated settings at the
 // bundler, which every surface reaches: they wire into
 // both Argo generators, a setting also given as a deprecated deployer:<key>

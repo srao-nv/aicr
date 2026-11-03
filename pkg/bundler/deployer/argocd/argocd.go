@@ -230,8 +230,11 @@ type ReadmeData struct {
 	AppName string
 }
 
-// compile-time interface check
-var _ deployer.Deployer = (*Generator)(nil)
+// compile-time interface checks
+var (
+	_ deployer.Deployer    = (*Generator)(nil)
+	_ deployer.Preflighter = (*Generator)(nil)
+)
 
 // Generator creates Argo CD Applications from recipe results.
 // Configure it with the required fields, then call Generate.
@@ -491,21 +494,16 @@ func resolveRepoSettings(g *Generator) (repoURL, targetRevision string) {
 	return repoURL, targetRevision
 }
 
-// Generate creates Argo CD Applications from the configured generator fields.
-//
-// Per-component content (Chart.yaml, values.yaml, cluster-values.yaml,
-// upstream.env, templates/) is delegated to localformat.Write, which emits
-// the uniform NNN-<name>/ folder layout. argocd then drops application.yaml
-// inside each NNN-<name>/ folder and writes the top-level app-of-apps.yaml.
-//
-//nolint:funlen // single-pass orchestration; further splitting just hides the linear flow.
-func (g *Generator) Generate(ctx context.Context, outputDir string) (*deployer.Output, error) {
-	start := time.Now()
+// Preflight runs every check Generate makes before its first write,
+// including the child Application names it would emit, and writes nothing.
+func (g *Generator) Preflight(ctx context.Context) error {
+	_, err := g.preflight(ctx)
+	return err
+}
 
-	output := &deployer.Output{
-		Files: make([]string, 0),
-	}
-
+// preflight returns the components in deployment order once every check
+// passes.
+func (g *Generator) preflight(ctx context.Context) ([]recipe.ComponentRef, error) {
 	if g.RecipeResult == nil {
 		return nil, errors.New(errors.ErrCodeInvalidRequest, "RecipeResult is required")
 	}
@@ -534,7 +532,7 @@ func (g *Generator) Generate(ctx context.Context, outputDir string) (*deployer.O
 	}
 
 	// Reject DynamicValues at the library boundary unless the caller
-	// explicitly opts in. The strip-pass below removes cluster-values.yaml
+	// explicitly opts in. Generate's strip-pass removes cluster-values.yaml
 	// from every NNN folder, so a standalone caller that populates
 	// DynamicValues would have those splits silently dropped from the
 	// bundle. argocdhelm sets AllowDynamicValueSplit because it surfaces
@@ -549,17 +547,6 @@ func (g *Generator) Generate(ctx context.Context, outputDir string) (*deployer.O
 						name, len(paths)))
 			}
 		}
-	}
-
-	repoURL, targetRevision := resolveRepoSettings(g)
-
-	// All three are baked unconditionally below: repoURL and targetRevision
-	// into app-of-apps.yaml and every child application.yaml, appName into
-	// the parent's metadata.name.
-	output.Source = deployer.Source{
-		RepoURL:        repoURL,
-		TargetRevision: targetRevision,
-		AppName:        g.appName(),
 	}
 
 	// Sort components by deployment order; validate names early.
@@ -587,6 +574,38 @@ func (g *Generator) Generate(ctx context.Context, outputDir string) (*deployer.O
 	}
 	if nameErr := ValidateChildAppNames(g.NamePrefix, g.appName(), releases); nameErr != nil {
 		return nil, nameErr
+	}
+	return components, nil
+}
+
+// Generate creates Argo CD Applications from the configured generator fields.
+//
+// Per-component content (Chart.yaml, values.yaml, cluster-values.yaml,
+// upstream.env, templates/) is delegated to localformat.Write, which emits
+// the uniform NNN-<name>/ folder layout. argocd then drops application.yaml
+// inside each NNN-<name>/ folder and writes the top-level app-of-apps.yaml.
+//
+//nolint:funlen // single-pass orchestration; further splitting just hides the linear flow.
+func (g *Generator) Generate(ctx context.Context, outputDir string) (*deployer.Output, error) {
+	start := time.Now()
+
+	components, preflightErr := g.preflight(ctx)
+	if preflightErr != nil {
+		return nil, preflightErr
+	}
+
+	repoURL, targetRevision := resolveRepoSettings(g)
+
+	// repoURL and targetRevision are baked unconditionally into
+	// app-of-apps.yaml and every child application.yaml, and appName into the
+	// parent's metadata.name.
+	output := &deployer.Output{
+		Files: make([]string, 0),
+		Source: deployer.Source{
+			RepoURL:        repoURL,
+			TargetRevision: targetRevision,
+			AppName:        g.appName(),
+		},
 	}
 
 	if err := os.MkdirAll(outputDir, 0755); err != nil {

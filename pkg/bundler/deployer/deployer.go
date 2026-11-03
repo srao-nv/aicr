@@ -108,6 +108,9 @@ type Output struct {
 	Source Source
 }
 
+// DataDir is the bundle directory that holds the external --data files.
+const DataDir = "data"
+
 // AddDataFiles resolves each relative data file path against outputDir (via
 // SafeJoin, rejecting traversal), stats the file, and appends the absolute
 // path to Files while adding the file size to TotalSize. Used by generators
@@ -136,4 +139,10 @@ func (o *Output) AddDataFiles(outputDir string, dataFiles []string) error {
 // Implementations are configured as structs, then Generate is called.
 type Deployer interface {
 	Generate(ctx context.Context, outputDir string) (*Output, error)
+}
+
+// Preflighter is implemented by a Deployer that can run the checks Generate
+// makes before its first write, without writing anything.
+type Preflighter interface {
+	Preflight(ctx context.Context) error
 }

@@ -413,9 +413,12 @@ func (b *DefaultBundler) makeSplit(
 		return nil, rootErr
 	}
 
-	dataFiles, err := b.copyDataFiles(stage, enabled.DataProvider())
+	dataSourceDir, dataFiles, err := listDataFiles(enabled.DataProvider())
 	if err != nil {
-		return nil, errors.PropagateOrWrap(err, errors.ErrCodeInternal, "failed to copy external data files")
+		return nil, err
+	}
+	if copyErr := copyDataFiles(stage, dataSourceDir); copyErr != nil {
+		return nil, copyErr
 	}
 
 	output := &deployer.Output{Files: make([]string, 0)}

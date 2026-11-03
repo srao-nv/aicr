@@ -283,9 +283,9 @@ func (b *DefaultBundler) Make(ctx context.Context, recipeResult *recipe.RecipeRe
 		return nil, errors.PropagateOrWrap(err, errors.ErrCodeInvalidRequest,
 			"invalid bundler configuration")
 	}
-	// Before any output exists: os.CopyFS will not overwrite the data files a
-	// rejected attempt leaves behind, so a corrected rerun into the same
-	// directory would fail.
+	// This check runs before any output exists. os.CopyFS will not overwrite
+	// the data files a rejected attempt leaves behind, so a corrected rerun
+	// into the same directory would fail.
 	if err := b.validateDeployerConfig(); err != nil {
 		return nil, err
 	}
@@ -414,6 +414,25 @@ func (b *DefaultBundler) Make(ctx context.Context, recipeResult *recipe.RecipeRe
 		return b.makeSplit(ctx, profileBaseline.ComponentRefs, recipeResult, componentValues, dir, upgradeNotes, start)
 	}
 
+	// The deployer tracks the --data files in checksums and attestation
+	// records them, so list them now and copy them once Preflight passes.
+	dataSourceDir, dataFiles, err := listDataFiles(recipeResult.DataProvider())
+	if err != nil {
+		return nil, err
+	}
+	d, err := b.buildDeployer(ctx, recipeResult, componentValues, dataFiles, upgradeNotice)
+	if err != nil {
+		return nil, err
+	}
+	// Preflight runs before any output exists. os.CopyFS will not overwrite
+	// the data files a rejected attempt leaves behind, so a corrected rerun
+	// into the same directory would fail.
+	if p, ok := d.(deployer.Preflighter); ok {
+		if preflightErr := p.Preflight(ctx); preflightErr != nil {
+			return nil, preflightErr
+		}
+	}
+
 	// No filesystem output is created until the final candidate has passed the
 	// profile state and mutability invariant above.
 	if dir == "" {
@@ -429,22 +448,10 @@ func (b *DefaultBundler) Make(ctx context.Context, recipeResult *recipe.RecipeRe
 		return nil, rootErr
 	}
 
-	// Copy external data files before deployer construction so the file list
-	// is available for both the deployer (checksum tracking) and post-generation
-	// attestation. This is a no-op when --data is not set.
-	dataFiles, err := b.copyDataFiles(dir, recipeResult.DataProvider())
-	if err != nil {
-		if _, ok := stderrors.AsType[*errors.StructuredError](err); ok {
-			return nil, err
-		}
-		return nil, errors.Wrap(errors.ErrCodeInternal,
-			"failed to copy external data files", err)
-	}
-
-	// Build the deployer and run it
-	d, err := b.buildDeployer(ctx, recipeResult, componentValues, dataFiles, upgradeNotice)
-	if err != nil {
-		return nil, err
+	// The copy precedes Generate, which stats each data file to track it in
+	// the bundle checksums.
+	if copyErr := copyDataFiles(dir, dataSourceDir); copyErr != nil {
+		return nil, copyErr
 	}
 	return b.runDeployer(ctx, d, recipeResult, dir, dataFiles, upgradeNotes, start)
 }
@@ -2894,46 +2901,46 @@ func componentValidationError(err error) error {
 		"component validation failed")
 }
 
-// copyDataFiles copies external data files from the --data directory into the bundle.
-// Returns a list of relative paths to the copied files (e.g., "data/overrides.yaml").
-// The provider argument supplies the LayeredDataProvider whose external directory is
-// the source of truth; a nil provider falls back to the package-global provider so
-// pre-WithDataProvider callers (legacy CLI path) still emit the same bundles.
-func (b *DefaultBundler) copyDataFiles(dir string, provider recipe.DataProvider) ([]string, error) {
-	// Check if the bound provider is a LayeredDataProvider with external
-	// files. A nil-interface receiver returns (nil, false) from the type
-	// assertion without panicking — equivalent to no external data.
+// listDataFiles returns the external --data directory and the bundle-relative
+// paths its files are copied to (e.g., "data/overrides.yaml"), and writes
+// nothing. Both are empty when the provider carries no external files. The
+// provider is the LayeredDataProvider whose external directory is the source
+// of truth; any other provider, including nil, carries no external data.
+func listDataFiles(provider recipe.DataProvider) (string, []string, error) {
 	layered, ok := provider.(*recipe.LayeredDataProvider)
 	if !ok {
-		return nil, nil // No external data
+		return "", nil, nil
 	}
-
 	externalFiles := layered.ExternalFiles()
 	if len(externalFiles) == 0 {
-		return nil, nil
+		return "", nil, nil
 	}
-
-	// Copy the entire external directory into bundle/data/ using os.CopyFS
-	dataDir, joinErr := deployer.SafeJoin(dir, "data")
-	if joinErr != nil {
-		return nil, errors.Wrap(errors.ErrCodeInternal, "unsafe data directory path", joinErr)
-	}
-	externalFS := os.DirFS(layered.ExternalDir())
-	if err := os.CopyFS(dataDir, externalFS); err != nil {
-		return nil, errors.Wrap(errors.ErrCodeInternal, "failed to copy external data files", err)
-	}
-
-	// Build the list of copied files (relative to bundle dir)
-	copiedFiles := make([]string, 0, len(externalFiles))
+	files := make([]string, 0, len(externalFiles))
 	for _, relPath := range externalFiles {
-		if _, pathErr := deployer.SafeJoin(dataDir, relPath); pathErr != nil {
-			return nil, errors.Wrap(errors.ErrCodeInvalidRequest, "unsafe external data path", pathErr)
+		if !filepath.IsLocal(relPath) {
+			return "", nil, errors.New(errors.ErrCodeInvalidRequest,
+				fmt.Sprintf("unsafe external data path %q", relPath))
 		}
-		copiedFiles = append(copiedFiles, filepath.Join("data", relPath))
+		files = append(files, filepath.Join(deployer.DataDir, relPath))
 	}
+	return layered.ExternalDir(), files, nil
+}
 
-	slog.Info("external data files copied into bundle", "count", len(copiedFiles))
-	return copiedFiles, nil
+// copyDataFiles copies the external --data directory sourceDir into the
+// bundle's data directory under dir. An empty sourceDir copies nothing.
+func copyDataFiles(dir, sourceDir string) error {
+	if sourceDir == "" {
+		return nil
+	}
+	dataDir, joinErr := deployer.SafeJoin(dir, deployer.DataDir)
+	if joinErr != nil {
+		return errors.Wrap(errors.ErrCodeInternal, "unsafe data directory path", joinErr)
+	}
+	if err := os.CopyFS(dataDir, os.DirFS(sourceDir)); err != nil {
+		return errors.Wrap(errors.ErrCodeInternal, "failed to copy external data files", err)
+	}
+	slog.Info("external data files copied into bundle", "dataDir", dataDir)
+	return nil
 }
 
 // attestBundle signs the bundle checksums and copies the binary attestation into the bundle.

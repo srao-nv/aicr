@@ -171,8 +171,11 @@ const (
 // component name or override key (guard test in pkg/recipe). See #1625.
 const rootValuesDeployerKey = "deployer"
 
-// compile-time interface check
-var _ deployer.Deployer = (*Generator)(nil)
+// compile-time interface checks
+var (
+	_ deployer.Deployer    = (*Generator)(nil)
+	_ deployer.Preflighter = (*Generator)(nil)
+)
 
 // Generator creates Helm chart app-of-apps bundles by transforming flat Argo CD output.
 // Configure it with the required fields, then call Generate.
@@ -303,69 +306,49 @@ type Generator struct {
 	UpgradeNotice string
 }
 
-// Generate creates a Helm chart app-of-apps by:
-//  1. Delegating to the flat Argo CD deployer for proven Application generation
-//  2. Transforming the output into a Helm chart with {{ .Values }} references
-func (g *Generator) Generate(ctx context.Context, outputDir string) (*deployer.Output, error) {
-	start := time.Now()
-
+// Preflight runs every check Generate makes before its first write,
+// including the child Application names the chart would emit, and writes
+// nothing.
+func (g *Generator) Preflight(ctx context.Context) error {
 	if g.RecipeResult == nil {
-		return nil, errors.New(errors.ErrCodeInvalidRequest, "RecipeResult is required")
+		return errors.New(errors.ErrCodeInvalidRequest, "RecipeResult is required")
 	}
 	if g.BundleChartVersion != "" {
 		if _, err := semver.StrictNewVersion(g.BundleChartVersion); err != nil {
-			return nil, errors.Wrap(errors.ErrCodeInvalidRequest,
+			return errors.Wrap(errors.ErrCodeInvalidRequest,
 				fmt.Sprintf("bundle chart version %q is not strict semantic versioning", g.BundleChartVersion), err)
 		}
 	}
 
-	// Defense-in-depth: validate AppName at the deployer boundary so a
-	// direct library caller (bypassing CLI/API validation) cannot ship a
-	// chart whose rendered Application would be rejected by apiserver
-	// admission. Empty resolves to DefaultAppName via the template's
-	// `.Values.appName | default` fallback at render time.
-	if err := bundlercfg.ValidateAppName(g.AppName); err != nil {
-		return nil, err
-	}
-	// Validate NamePrefix itself here, not only as part of the composed child
-	// names checked after the base generation, so zero-folder recipes still
-	// reject a malformed prefix.
-	if err := bundlercfg.ValidateNamePrefix(g.NamePrefix); err != nil {
-		return nil, err
-	}
-	if err := bundlercfg.ValidateDestinationServer(g.DestinationServer); err != nil {
-		return nil, err
-	}
-	// ValidateProject (not ValidateAppName) is load-bearing: it mirrors
-	// IsDNS1123Subdomain exactly, matching the install-time
-	// values.schema.json pattern, so a baked Project default can never
-	// make the generated bundle fail its own schema at install time.
-	if err := bundlercfg.ValidateProject(g.Project); err != nil {
-		return nil, err
-	}
+	// The planner validates the baked deployer defaults at the deployer
+	// boundary, so a direct library caller cannot ship a chart that fails
+	// apiserver admission or its own values.schema.json at install time. The
+	// baked NamePrefix also composes into every child name it plans. The
+	// rendered template guard covers install-time deployer.namePrefix
+	// overrides.
+	planner := g.baseGenerator()
+	planner.NamePrefix = g.NamePrefix
+	planner.DestinationServer = g.DestinationServer
+	planner.Project = g.Project
+	return planner.Preflight(ctx)
+}
 
-	// Step 1: Generate flat Argo CD output to a temp directory
-	tmpDir, err := os.MkdirTemp("", "argocdhelm-*")
-	if err != nil {
-		return nil, errors.Wrap(errors.ErrCodeInternal, "failed to create temp directory", err)
-	}
-	defer os.RemoveAll(tmpDir)
-
-	// When no explicit --target-revision (or OCI tag from -o oci://...:<tag>)
-	// is set, default to the chart version. helm push uses Chart.yaml's
-	// version as the OCI tag, so this default keeps the bundle's children
-	// and parent Application referencing the same tag a subsequent
-	// `helm push` would produce — without that, child Apps would point at
-	// "main" (the upstream argocd deployer's git-shaped default) and fail
-	// to resolve against the published chart.
-	targetRevision := g.targetRevision()
-
-	argocdGen := &argocd.Generator{
-		RecipeResult:           g.RecipeResult,
-		ComponentValues:        g.ComponentValues,
-		Version:                g.Version,
-		RepoURL:                g.RepoURL,
-		TargetRevision:         targetRevision,
+// baseGenerator returns the flat Argo CD generator whose output Generate
+// transforms into the chart.
+func (g *Generator) baseGenerator() *argocd.Generator {
+	return &argocd.Generator{
+		RecipeResult:    g.RecipeResult,
+		ComponentValues: g.ComponentValues,
+		Version:         g.Version,
+		RepoURL:         g.RepoURL,
+		// When no explicit --target-revision (or OCI tag from -o
+		// oci://...:<tag>) is set, default to the chart version. helm push
+		// uses Chart.yaml's version as the OCI tag, so this default keeps the
+		// bundle's children and parent Application referencing the same tag
+		// a subsequent `helm push` would produce. Without it, child Apps
+		// would point at "main" (the upstream argocd deployer's git-shaped
+		// default) and fail to resolve against the published chart.
+		TargetRevision:         g.targetRevision(),
 		IncludeChecksums:       false, // we generate our own checksums
 		ComponentPreManifests:  g.ComponentPreManifests,
 		ComponentPostManifests: g.ComponentPostManifests,
@@ -394,23 +377,29 @@ func (g *Generator) Generate(ctx context.Context, outputDir string) (*deployer.O
 		CascadeDelete: g.CascadeDelete,
 		SyncRetry:     g.SyncRetry,
 	}
+}
 
-	baseOut, genErr := argocdGen.Generate(ctx, tmpDir)
-	if genErr != nil {
+// Generate creates a Helm chart app-of-apps by:
+//  1. Delegating to the flat Argo CD deployer for proven Application generation
+//  2. Transforming the output into a Helm chart with {{ .Values }} references
+func (g *Generator) Generate(ctx context.Context, outputDir string) (*deployer.Output, error) {
+	start := time.Now()
+
+	if err := g.Preflight(ctx); err != nil {
+		return nil, err
+	}
+
+	// Step 1: Generate flat Argo CD output to a temp directory
+	tmpDir, err := os.MkdirTemp("", "argocdhelm-*")
+	if err != nil {
+		return nil, errors.Wrap(errors.ErrCodeInternal, "failed to create temp directory", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	if _, genErr := g.baseGenerator().Generate(ctx, tmpDir); genErr != nil {
 		// PropagateOrWrap keeps the delegate's code, so a chart digest
 		// mismatch reports CONFLICT here as it does under the argocd deployer.
 		return nil, errors.PropagateOrWrap(genErr, errors.ErrCodeInternal, "failed to generate base Argo CD output")
-	}
-
-	// The baked NamePrefix default composes into every child template, so
-	// validate it against the emitted releases before outputDir exists. The
-	// rendered template guard covers install-time deployer.namePrefix overrides.
-	releases := make([]string, 0, len(baseOut.Releases))
-	for _, r := range baseOut.Releases {
-		releases = append(releases, r.Name)
-	}
-	if nameErr := argocd.ValidateChildAppNames(g.NamePrefix, cmp.Or(g.AppName, DefaultAppName), releases); nameErr != nil {
-		return nil, nameErr
 	}
 
 	// Step 2: Create Helm chart output structure
