@@ -18,6 +18,8 @@ import (
 	"context"
 	stderrors "errors"
 	"io/fs"
+	"os"
+	"path/filepath"
 	"slices"
 	"testing"
 
@@ -67,6 +69,26 @@ func TestProvider(t *testing.T) {
 	if got := custom.Source("registry.yaml"); got != recipe.CatalogSourceExternal {
 		t.Errorf("Source() with WithSource = %q, want %q", got, recipe.CatalogSourceExternal)
 	}
+}
+
+func TestWriteDir(t *testing.T) {
+	files := map[string][]byte{
+		"registry.yaml":                       []byte(providertest.EmptyRegistryYAML),
+		"components/gpu-operator/values.yaml": []byte("v"),
+	}
+	dir := providertest.WriteDir(t, files)
+	for name, want := range files {
+		got, err := os.ReadFile(filepath.Join(dir, filepath.FromSlash(name)))
+		if err != nil || string(got) != string(want) {
+			t.Errorf("read %s = %q, %v, want %q", name, got, err, want)
+		}
+	}
+	layered, err := recipe.NewLayeredDataProvider(recipe.NewEmbeddedDataProvider(recipe.GetEmbeddedFS(), ""),
+		recipe.LayeredProviderConfig{ExternalDir: dir})
+	if err != nil {
+		t.Fatalf("EmptyRegistryYAML does not load as a --data registry: %v", err)
+	}
+	recipe.EvictCachedRegistry(layered)
 }
 
 func TestProviderContextDone(t *testing.T) {
